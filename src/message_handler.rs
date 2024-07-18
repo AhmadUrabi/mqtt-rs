@@ -7,8 +7,8 @@ enum MessageType {
     Delete,
 }
 
-pub fn read_message(message: serde_json::Value) -> bool {
-    let msg_type = get_type(&message);
+pub async fn read_message(message: serde_json::Value) -> bool {
+    let msg_type = get_type(&message).await;
     if msg_type.is_err() {
         return false;
     }
@@ -23,25 +23,25 @@ pub fn read_message(message: serde_json::Value) -> bool {
     println!("Data Type: {:?}", msg_type);
     println!("Data: {:?}", data);
 
-    handle_message(msg_type, data);
+    handle_message(msg_type, data).await;
     true
 }
 
-fn handle_message(msg_type: MessageType, data: serde_json::Value) {
+async fn handle_message(msg_type: MessageType, data: serde_json::Value) {
     if msg_type == MessageType::Delete {
-        delete_key(data.to_string());
+        delete_key(data.to_string().trim_matches('"').to_string()).await;
         return;
     }
     let id = data["feature"]["id"].as_str().unwrap().to_string();
     let data = data.to_string();
     match msg_type {
-        MessageType::Create => add_key(id, data),
-        MessageType::Edit => add_key(id, data),
+        MessageType::Create => add_key(id, data).await,
+        MessageType::Edit => add_key(id, data).await,
         _ => {}
     }
 }
 
-fn get_type(message: &serde_json::Value) -> Result<MessageType, String> {
+async fn get_type(message: &serde_json::Value) -> Result<MessageType, String> {
     let msg_type = message["type"].as_str();
     if msg_type.is_none() {
         return Err("Message type not found".to_string());

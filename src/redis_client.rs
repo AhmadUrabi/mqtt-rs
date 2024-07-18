@@ -1,32 +1,112 @@
-use redis::Commands;
+use redis::{AsyncCommands, RedisResult};
+use serde::{Deserialize, Serialize};
 
-fn get_redis() -> Result<redis::Connection, String> {
+async fn get_redis() -> Result<redis::aio::MultiplexedConnection, String> {
     let client = redis::Client::open("redis://127.0.0.1/").unwrap();
-    let con = client.get_connection().unwrap();
-
+    // let mut con = client.get_connection().await?;
+    let con = client.get_multiplexed_tokio_connection().await.unwrap();
     Ok(con)
 }
 
-pub fn get_all_features() -> Result<Vec<serde_json::Value>, String> {
-    let con = get_redis();
-    let keys: Vec<String> = con.unwrap().smembers("AllFeatures").unwrap_or(vec![]);
+pub async fn get_all_features() -> Result<Vec<serde_json::Value>, String> {
+    let mut con = get_redis().await.unwrap();
+    let keys: Vec<String> = con.smembers("AllFeatures").await.unwrap_or(vec![]);
     let mut res: Vec<serde_json::Value> = vec![];
     for i in keys {
-        let temp_con = get_redis();
-        let value: String = temp_con.unwrap().get(i.as_str()).unwrap();
+        let value: String = con.get(i.as_str()).await.unwrap();
         res.push(serde_json::from_str(&value).unwrap());
     }
     Ok(res)
 }
 
-pub fn add_key(id: String, value: String) {
-    let con = get_redis();
-    let _: () = con.unwrap().set(&id, value).unwrap();
-    let con2 = get_redis();
-    let _: () = con2.unwrap().sadd("AllFeatures", &id).unwrap();
+pub async fn add_key(id: String, value: String) {
+    let mut con = get_redis().await.unwrap();
+    let _: () = con.set(&id, value).await.unwrap();
+    let _: () = con.sadd("AllFeatures", &id).await.unwrap();
 }
 
-pub fn delete_key(id: String) {
-    let con = get_redis();
-    let _: () = con.unwrap().del(id).unwrap();
+pub async fn delete_key(id: String) {
+    println!("Deleting key: {}", id);
+    let mut con = get_redis().await.unwrap();
+    match con.del::<String, ()>(id.clone()).await {
+        Ok(_) => {}
+        Err(_) => {
+            println!("Key not found: {}", id);
+            return;
+        }
+    }
+    let _: () = con.srem("AllFeatures", id.clone()).await.unwrap();
+}
+
+pub async fn append_stream(id: String, value: (f64, f64)) {
+    let mut con = get_redis().await.unwrap();
+    let _: () = con
+        .xadd(id, "*", &[("Latitude", value.0), ("Longitude", value.1)])
+        .await
+        .unwrap();
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct StreamObj {
+    id: String,
+    coordinates: Coordinates,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Coordinates {
+    latitude: f64,
+    longitude: f64,
+}
+
+type StreamData = (String, String, String, String);
+
+pub async fn get_stream(id: &str) -> Vec<StreamObj> {
+    let mut con = get_redis().await.unwrap();
+    let count = 50;
+    // Get the ID of the last entry in the stream
+    let last_entry: RedisResult<Vec<Vec<(String, Vec<StreamData>)>>> =
+        con.xrevrange_count(id, "+", "-", 1).await;
+
+    let last_id = match last_entry {
+        Ok(entries) => entries
+            .first()
+            .unwrap()
+            .first()
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| "0-0".to_string()),
+        Err(_) => "0-0".to_string(),
+    };
+
+    // Get the last 50 entries
+    let mut res: Vec<StreamObj> = vec![];
+    let entries: RedisResult<Vec<Vec<(String, Vec<StreamData>)>>> =
+        con.xrevrange_count(id, last_id, "-", count).await;
+
+    match entries {
+        Ok(entries) => {
+            for entry in entries.iter().rev() {
+                for (field, data) in entry.iter() {
+                    for (_, latitude, _, longitude) in data.iter() {
+                        res.push(StreamObj {
+                            id: field.clone(),
+                            coordinates: Coordinates {
+                                latitude: latitude.parse::<f64>().unwrap(),
+                                longitude: longitude.parse::<f64>().unwrap(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("Error reading stream: {}", err);
+        }
+    }
+
+    res
+}
+
+pub async fn reset_stream(id: &str) {
+    let mut con = get_redis().await.unwrap();
+    let _: () = con.del(id).await.unwrap();
 }
