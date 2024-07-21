@@ -20,7 +20,7 @@ struct DroneStateData {
     // temperature: f64,
     latitude: f64,
     longitude: f64,
-    height: f64,
+    rotation: f64,
 }
 
 pub async fn create_fake_data(previous_state: &Option<DroneData>) -> DroneData {
@@ -37,7 +37,7 @@ pub async fn create_fake_data(previous_state: &Option<DroneData>) -> DroneData {
                 // temperature: 0.0,
                 latitude: 31.9544,
                 longitude: 35.9106,
-                height: 0.0,
+                rotation: 0.0,
             },
         };
     }
@@ -48,16 +48,19 @@ pub async fn create_fake_data(previous_state: &Option<DroneData>) -> DroneData {
     // let y: f64 = rng.gen();
     // let direction = if y > 0.5 { 1.0 } else { -1.0 };
 
-    let delta_x = rng.gen_range(0.00..0.001);
-    let delta_y = rng.gen_range(0.00..0.001);
+    let delta_x = rng.gen_range(0.00..0.0001);
+    let delta_y = rng.gen_range(0.00..0.0001);
+    let ration: f32 = delta_y / delta_x;
+    let rotation = ration.atan();
 
     old.timestamp = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i32;
 
-    old.data.latitude += delta_y;
-    old.data.longitude += delta_x;
+    old.data.latitude += delta_y as f64;
+    old.data.longitude += delta_x as f64;
+    old.data.rotation = rotation as f64;
     append_stream(
         "drone_data".to_owned(),
         (old.data.latitude, old.data.longitude),
