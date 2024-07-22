@@ -1,4 +1,3 @@
-use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::time::UNIX_EPOCH;
 
@@ -23,9 +22,13 @@ struct DroneStateData {
     rotation: f64,
 }
 
-pub async fn create_fake_data(previous_state: &Option<DroneData>) -> DroneData {
+pub async fn create_fake_data(
+    con: redis::aio::MultiplexedConnection,
+    previous_state: &Option<DroneData>,
+) -> DroneData {
+    // println!("Creating Fake Data");
     if previous_state.is_none() {
-        reset_stream("drone_data").await;
+        reset_stream(con.clone(), "drone_data").await;
         return DroneData {
             tid: "TID".to_string(),
             bid: "BID".to_string(),
@@ -44,12 +47,13 @@ pub async fn create_fake_data(previous_state: &Option<DroneData>) -> DroneData {
 
     let mut old = previous_state.clone().unwrap();
 
-    let mut rng = rand::thread_rng();
+    let rng_x = rand::random::<f32>();
+    let rng_y = rand::random::<f32>();
     // let y: f64 = rng.gen();
     // let direction = if y > 0.5 { 1.0 } else { -1.0 };
 
-    let delta_x = rng.gen_range(0.00..0.0001);
-    let delta_y = rng.gen_range(0.00..0.0001);
+    let delta_x = rng_x * 0.0001;
+    let delta_y = rng_y * 0.0001;
     let ration: f32 = delta_y / delta_x;
     let rotation = ration.atan();
 
@@ -61,10 +65,14 @@ pub async fn create_fake_data(previous_state: &Option<DroneData>) -> DroneData {
     old.data.latitude += delta_y as f64;
     old.data.longitude += delta_x as f64;
     old.data.rotation = rotation as f64;
+
+    // println!("Appending to Stream");
     append_stream(
+        con.clone(),
         "drone_data".to_owned(),
         (old.data.latitude, old.data.longitude),
     )
     .await;
+    // println!("Appended to Stream, returning data");
     return old;
 }

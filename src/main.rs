@@ -22,8 +22,8 @@ mod message_handler;
 mod redis_client;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use std::{sync::Arc, thread};
 
 use drone_emulator::{create_fake_data, DroneData};
 use redis_client::StreamObj;
@@ -32,6 +32,8 @@ use rocket::http::Header;
 use rocket::serde::json::Json;
 use rocket::{Request, Response};
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
+
+// use dotenv::dotenv;
 
 pub struct CORS;
 // CORS control
@@ -57,13 +59,17 @@ impl Fairing for CORS {
 
 #[get("/")]
 async fn index() -> Json<Vec<serde_json::Value>> {
-    let v = redis_client::get_all_features().await.unwrap_or(vec![]);
+    let connection = redis_client::get_redis().await.unwrap();
+    let v = redis_client::get_all_features(connection)
+        .await
+        .unwrap_or(vec![]);
     Json(v)
 }
 
 #[get("/stream")]
 async fn get_stream_route() -> Json<Vec<StreamObj>> {
-    let v = redis_client::get_stream("drone_data").await;
+    let connection = redis_client::get_redis().await.unwrap();
+    let v = redis_client::get_stream(connection, "drone_data").await;
     Json(v)
 }
 
@@ -71,6 +77,8 @@ async fn get_stream_route() -> Json<Vec<StreamObj>> {
 async fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_signal = shutdown.clone();
+
+    let connection = redis_client::get_redis().await.unwrap();
 
     // Set up Ctrl+C handler
     ctrlc::set_handler(move || {
@@ -80,7 +88,14 @@ async fn main() {
     .expect("Error setting Ctrl+C handler");
 
     // MQTT setup
-    let mut mqttoptions = MqttOptions::new("rumqtt-async", "localhost", 1883);
+    let mut mqttoptions = MqttOptions::new(
+        "rumqtt-async",
+        std::env::var("MQTT_BROKER_HOST").unwrap(),
+        std::env::var("MQTT_BROKER_PORT")
+            .unwrap()
+            .parse::<u16>()
+            .unwrap(),
+    );
     mqttoptions.set_keep_alive(Duration::from_secs(5));
 
     let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
@@ -90,63 +105,83 @@ async fn main() {
         .attach(CORS)
         .mount("/", routes![index, get_stream_route]);
     // Start Rocket server in a separate thread
-    let rocket_handle = thread::spawn(move || {
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let _ = server.launch().await;
-        });
+    let rocket_handle = tokio::spawn(async move {
+        println!("Starting Rocket server");
+        let _ = server.launch().await;
     });
 
     // Start MQTT event loop in a separate thread and end it when the shutdown signal is received
     let mqtt_client_handle = {
         let shutdown = shutdown.clone();
-        thread::spawn(move || {
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                while !shutdown.load(Ordering::SeqCst) {
-                    if let Ok(notification) = eventloop.poll().await {
-                        match notification {
-                            Event::Incoming(i) => match i {
-                                Incoming::Publish(p) => {
-                                    let bytes = p.payload.to_vec();
-                                    let payload = String::from_utf8(bytes).unwrap();
-                                    let msg: serde_json::Value =
-                                        serde_json::from_str(&payload).unwrap();
-                                    message_handler::read_message(msg).await;
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            println!("Starting MQTT client");
+
+            while !shutdown.load(Ordering::SeqCst) {
+                if let Ok(notification) = eventloop.poll().await {
+                    match notification {
+                        Event::Incoming(i) => match i {
+                            Incoming::Publish(p) => {
+                                // println!("Handling Input");
+                                let bytes = p.payload.to_vec();
+                                let payload = String::from_utf8(bytes).unwrap_or("".to_owned());
+
+                                match serde_json::from_str::<serde_json::Value>(&payload) {
+                                    Ok(msg) => {
+                                        message_handler::read_message(connection.clone(), msg)
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        println!("Error reading message: {:?}", e);
+                                    }
                                 }
-                                _ => {}
-                            },
+                            }
                             _ => {}
-                        }
+                        },
+                        _ => {}
                     }
                 }
-            });
+            }
         })
     };
 
     let mqtt_publisher_handler = {
         let shutdown = shutdown.clone();
-        thread::spawn(move || {
-            let shutdown = shutdown.clone();
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            println!("Starting drone emulator");
+            // let shutdown = shutdown.clone();
             let mut previous_state: Option<DroneData> = None;
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                while !shutdown.load(Ordering::SeqCst) {
-                    let data = create_fake_data(&previous_state).await;
-                    previous_state = Some(data.clone());
-                    let payload: String = serde_json::to_string(&data).unwrap();
-                    client
-                        .publish("topic/drone", QoS::AtMostOnce, false, payload)
+            while !shutdown.load(Ordering::SeqCst) {
+                // println!("Publishing data");
+                let data = create_fake_data(connection.clone(), &previous_state).await;
+                // println!("Data Complete");
+                previous_state = Some(data.clone());
+                let payload: String = serde_json::to_string(&data).unwrap_or("".to_owned());
+                // println!("Publishing to topic");
+                let client = client.clone();
+                tokio::spawn(async move {
+                    match client
+                        .publish("topic/drone", QoS::AtLeastOnce, false, payload)
                         .await
-                        .unwrap();
-                    thread::sleep(Duration::from_secs(1));
-                }
-            });
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            println!("Error publishing data: {:?}", e);
+                        }
+                    }
+                });
+                // println!("Data published, sleeping for 1 second");
+                std::thread::sleep(Duration::from_secs(1));
+            }
         })
     };
 
     while !shutdown.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    mqtt_publisher_handler.join().unwrap();
-    mqtt_client_handle.join().unwrap();
-    rocket_handle.join().unwrap();
+    mqtt_publisher_handler.await.unwrap();
+    mqtt_client_handle.await.unwrap();
+    rocket_handle.await.unwrap();
 }

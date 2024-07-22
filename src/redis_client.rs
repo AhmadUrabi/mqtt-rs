@@ -1,15 +1,29 @@
 use redis::{AsyncCommands, RedisResult};
 use serde::{Deserialize, Serialize};
 
-async fn get_redis() -> Result<redis::aio::MultiplexedConnection, String> {
-    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+pub async fn get_redis() -> Result<redis::aio::MultiplexedConnection, String> {
+    let client = redis::Client::open(
+        std::env::var("REDIS_CONNECTION").unwrap_or("redis://redis:6379".to_owned()),
+    )
+    .unwrap();
     // let mut con = client.get_connection().await?;
-    let con = client.get_multiplexed_tokio_connection().await.unwrap();
-    Ok(con)
+    let mut attempts = 10;
+    while attempts > 0 {
+        match client.get_multiplexed_tokio_connection().await {
+            Ok(con) => return Ok(con),
+            Err(_) => {
+                attempts -= 1;
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+    Err("Failed to connect to Redis".to_owned())
 }
 
-pub async fn get_all_features() -> Result<Vec<serde_json::Value>, String> {
-    let mut con = get_redis().await.unwrap();
+pub async fn get_all_features(
+    mut con: redis::aio::MultiplexedConnection,
+) -> Result<Vec<serde_json::Value>, String> {
+    // let mut con = get_redis().await.unwrap();
     let keys: Vec<String> = con.smembers("AllFeatures").await.unwrap_or(vec![]);
     let mut res: Vec<serde_json::Value> = vec![];
     for i in keys {
@@ -19,15 +33,15 @@ pub async fn get_all_features() -> Result<Vec<serde_json::Value>, String> {
     Ok(res)
 }
 
-pub async fn add_key(id: String, value: String) {
-    let mut con = get_redis().await.unwrap();
+pub async fn add_key(mut con: redis::aio::MultiplexedConnection, id: String, value: String) {
+    // let mut con = get_redis().await.unwrap();
     let _: () = con.set(&id, value).await.unwrap();
     let _: () = con.sadd("AllFeatures", &id).await.unwrap();
 }
 
-pub async fn delete_key(id: String) {
+pub async fn delete_key(mut con: redis::aio::MultiplexedConnection, id: String) {
     println!("Deleting key: {}", id);
-    let mut con = get_redis().await.unwrap();
+    // let mut con = get_redis().await.unwrap();
     match con.del::<String, ()>(id.clone()).await {
         Ok(_) => {}
         Err(_) => {
@@ -38,12 +52,24 @@ pub async fn delete_key(id: String) {
     let _: () = con.srem("AllFeatures", id.clone()).await.unwrap();
 }
 
-pub async fn append_stream(id: String, value: (f64, f64)) {
-    let mut con = get_redis().await.unwrap();
-    let _: () = con
-        .xadd(id, "*", &[("Latitude", value.0), ("Longitude", value.1)])
+pub async fn append_stream(
+    mut con: redis::aio::MultiplexedConnection,
+    id: String,
+    value: (f64, f64),
+) {
+    // let mut con = get_redis().await.unwrap();
+    // println!("Append Stream fn");
+    match con
+        .xadd::<String, &str, &str, f64, ()>(
+            id.into(),
+            "*",
+            &[("Latitude", value.0), ("Longitude", value.1)],
+        )
         .await
-        .unwrap();
+    {
+        Ok(_) => println!("Successfully Appended"),
+        Err(e) => println!("Error appending: {:?}", e),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,8 +86,8 @@ pub struct Coordinates {
 
 type StreamData = (String, String, String, String);
 
-pub async fn get_stream(id: &str) -> Vec<StreamObj> {
-    let mut con = get_redis().await.unwrap();
+pub async fn get_stream(mut con: redis::aio::MultiplexedConnection, id: &str) -> Vec<StreamObj> {
+    // let mut con = get_redis().await.unwrap();
     let count = 50;
     // Get the ID of the last entry in the stream
     let last_entry: RedisResult<Vec<Vec<(String, Vec<StreamData>)>>> =
@@ -106,7 +132,7 @@ pub async fn get_stream(id: &str) -> Vec<StreamObj> {
     res
 }
 
-pub async fn reset_stream(id: &str) {
-    let mut con = get_redis().await.unwrap();
+pub async fn reset_stream(mut con: redis::aio::MultiplexedConnection, id: &str) {
+    // let mut con = get_redis().await.unwrap();
     let _: () = con.del(id).await.unwrap();
 }
