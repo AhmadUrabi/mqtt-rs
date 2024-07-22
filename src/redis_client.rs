@@ -67,7 +67,7 @@ pub async fn append_stream(
         )
         .await
     {
-        Ok(_) => println!("Successfully Appended"),
+        Ok(_) => {}
         Err(e) => println!("Error appending: {:?}", e),
     }
 }

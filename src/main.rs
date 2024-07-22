@@ -31,8 +31,8 @@ use rocket::fairing::{Fairing, Info, Kind};
 use rocket::http::Header;
 use rocket::serde::json::Json;
 use rocket::{Request, Response};
-use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
-
+use rumqttc::{AsyncClient, Event, EventLoop, Incoming, MqttOptions, QoS};
+use tokio::time::timeout;
 // use dotenv::dotenv;
 
 pub struct CORS;
@@ -90,18 +90,35 @@ async fn main() {
     // MQTT setup
     let mut mqttoptions = MqttOptions::new(
         "rumqtt-async",
-        std::env::var("MQTT_BROKER_HOST").unwrap(),
+        std::env::var("MQTT_BROKER_HOST").unwrap_or("rabbitmq".to_owned()),
         std::env::var("MQTT_BROKER_PORT")
-            .unwrap()
+            .unwrap_or("1883".to_owned())
             .parse::<u16>()
-            .unwrap(),
+            .unwrap_or(1883),
     );
     mqttoptions.set_keep_alive(Duration::from_secs(5));
 
-    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
+    let (mut client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
     client.subscribe("presence", QoS::AtMostOnce).await.unwrap();
 
-    let server = rocket::build()
+    let mut attempts = 10;
+    while attempts > 0 {
+        if check_mqtt_connection(&mut client, &mut eventloop).await {
+            println!("Connection is healthy");
+            break;
+        } else {
+            println!("Connection check failed");
+            attempts -= 1;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    if attempts == 0 {
+        panic!("Failed to connect to MQTT broker");
+    }
+
+    let figment = rocket::Config::figment().merge(("port", 3000));
+
+    let server = rocket::custom(figment)
         .attach(CORS)
         .mount("/", routes![index, get_stream_route]);
     // Start Rocket server in a separate thread
@@ -160,17 +177,15 @@ async fn main() {
                 let payload: String = serde_json::to_string(&data).unwrap_or("".to_owned());
                 // println!("Publishing to topic");
                 let client = client.clone();
-                tokio::spawn(async move {
-                    match client
-                        .publish("topic/drone", QoS::AtLeastOnce, false, payload)
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            println!("Error publishing data: {:?}", e);
-                        }
+                match client
+                    .publish("topic/drone", QoS::AtLeastOnce, false, payload)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        println!("Error publishing data: {:?}", e);
                     }
-                });
+                }
                 // println!("Data published, sleeping for 1 second");
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -184,4 +199,47 @@ async fn main() {
     mqtt_publisher_handler.await.unwrap();
     mqtt_client_handle.await.unwrap();
     rocket_handle.await.unwrap();
+}
+
+async fn check_mqtt_connection(client: &mut AsyncClient, eventloop: &mut EventLoop) -> bool {
+    let topic = "topic/healthcheck";
+    let payload = "ping";
+
+    match timeout(
+        Duration::from_secs(5),
+        client.publish(topic, QoS::AtLeastOnce, false, payload),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            println!("Ping message published, waiting for pong...");
+            loop {
+                match timeout(Duration::from_secs(5), eventloop.poll()).await {
+                    Ok(Ok(Event::Incoming(_))) => {
+                        println!("Received pong from broker");
+                        return true;
+                    }
+                    Ok(Ok(_)) => {
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        println!("Error receiving pong: {:?}", e);
+                        return false;
+                    }
+                    Err(_) => {
+                        println!("Timed out waiting for pong");
+                        return false;
+                    }
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            println!("Error publishing ping message: {:?}", e);
+            return false;
+        }
+        Err(_) => {
+            println!("Timed out publishing ping message");
+            return false;
+        }
+    }
 }

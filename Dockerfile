@@ -28,6 +28,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
+COPY --from=planner /app/Rocket.toml Rocket.toml
 # Build dependencies - this is the caching Docker layer!
 RUN cargo chef cook --release --recipe-path recipe.json
 # Build application
@@ -38,4 +39,6 @@ RUN cargo build --release --bin mqtt-rs
 FROM debian:bullseye-slim AS runtime
 WORKDIR /app
 COPY --from=builder /app/target/release/mqtt-rs /usr/local/bin
+COPY --from=builder /app/Rocket.toml Rocket.toml
+EXPOSE 3000
 ENTRYPOINT ["/usr/local/bin/mqtt-rs"]
